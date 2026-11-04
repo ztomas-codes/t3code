@@ -235,6 +235,7 @@ export interface CommandPaletteView {
   readonly addonIcon: ReactNode;
   readonly groups: ReadonlyArray<CommandPaletteGroup>;
   readonly initialQuery?: string;
+  readonly task?: { readonly prompt: string; readonly projectKey?: string };
 }
 
 // Child search unmounts the palette; retain search data without its view closures.

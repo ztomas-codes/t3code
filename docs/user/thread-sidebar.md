@@ -217,6 +217,12 @@ The linked pull request participates in automatic settlement.
 
 ## Find and reference work
 
+On web and desktop, you can also start work from the command palette. Type a prompt,
+choose **New task** at the end of the results, and select a project. If that project
+has checkouts on multiple machines, choose where to run it. Confirming the destination
+immediately sends the prompt in a new thread using that project's default model,
+permissions, and workspace mode. Press Escape to go back a step without losing the prompt.
+
 On web and desktop, open the command palette with `Cmd/Ctrl+K` to search threads
 across connected environments by title, branch, pull request, or project.
 Threads you open often or recently rank higher, and for three weeks the thread

@@ -92,6 +92,9 @@ import { useAtomValue } from "@effect/atom-react";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
+import { useStartProjectTask } from "../hooks/useStartProjectTask";
+import { resolveProjectTaskModel } from "../lib/projectTask";
+import type { Project } from "../types";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { copyThreadReference } from "../lib/copyThreadReference";
 import {
@@ -500,6 +503,10 @@ function OpenCommandPaletteDialog(props: {
   const threads = useVisibleThreadShells().filter((thread) => !isSidebarHiddenThread(thread));
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const providersByEnvironment = useEnvironmentProviders();
+  const startProjectTask = useStartProjectTask();
+  const serverConfigs = useServerConfigs();
+  const [isStartingTask, setIsStartingTask] = useState(false);
+  const taskSubmittingRef = useRef(false);
   const { changeThemeItem, changeAppearanceItem, themeEditorItem } = useCommandPaletteThemeItems();
   const currentView = viewStack.at(-1)?.view ?? null;
   const threadSearchQuery = currentView === null && !isActionsOnly ? deferredQuery : "";
@@ -643,7 +650,10 @@ function OpenCommandPaletteDialog(props: {
         )
       : "";
   const canBrowsePaths =
-    browseEnvironmentId !== null && !isRemoteProjectRepositoryStep && newProjectFlow === null;
+    browseEnvironmentId !== null &&
+    !isRemoteProjectRepositoryStep &&
+    newProjectFlow === null &&
+    !currentView?.task;
   const browsePath = getFilesystemBrowsePath(query, browseEnvironmentPlatform, canBrowsePaths);
   const isBrowsing = browsePath.isBrowsing;
   const browseDirectoryPath = browsePath.directoryPath;
@@ -2317,8 +2327,140 @@ function OpenCommandPaletteDialog(props: {
           },
         ];
 
+  const task = currentView?.task;
+  const taskViewIcon = <SquarePenIcon className={ADDON_ICON_CLASS} />;
+  const machineViewIcon = <MonitorIcon className={ADDON_ICON_CLASS} />;
+  const taskRecentUseByProject = new Map<string, number>();
+  if (task) {
+    for (const thread of threads) {
+      const key = `${thread.environmentId}:${thread.projectId}`;
+      taskRecentUseByProject.set(
+        key,
+        Math.max(
+          taskRecentUseByProject.get(key) ?? 0,
+          Date.parse(thread.latestUserMessageAt ?? thread.createdAt),
+          Date.parse(thread.lastVisitedAt ?? thread.createdAt),
+        ),
+      );
+    }
+  }
+  const taskProjectEntries = (task ? projectPickerEntries : [])
+    .map((entry) => {
+      const membersByEnvironment = new Map(
+        entry.group.memberProjects
+          .filter((project) => project.archivedAt == null)
+          .map((project) => [project.environmentId, project]),
+      );
+      if (entry.targetProject.archivedAt == null) {
+        membersByEnvironment.set(entry.targetProject.environmentId, entry.targetProject);
+      }
+      return {
+        ...entry,
+        members: [...membersByEnvironment.values()],
+        recentUse: Math.max(
+          0,
+          ...entry.group.memberProjectRefs.map(
+            (ref) => taskRecentUseByProject.get(`${ref.environmentId}:${ref.projectId}`) ?? 0,
+          ),
+        ),
+      };
+    })
+    .filter((entry) => !entry.group.archived && entry.members.length > 0)
+    .toSorted(
+      (left, right) =>
+        Number(right.isPreferred) - Number(left.isPreferred) || right.recentUse - left.recentUse,
+    );
+  const taskTargetAvailable = (project: Project) =>
+    environments.some(
+      (environment) =>
+        environment.environmentId === project.environmentId &&
+        environment.connection.phase === "connected",
+    ) && readEnvironmentScope(project.environmentId, AuthOrchestrationOperateScope);
+  const taskModelLabel = (project: Project) => {
+    const config = serverConfigs.get(project.environmentId);
+    return config
+      ? (resolveProjectTaskModel(project, {
+          ...config,
+          providers: providersByEnvironment.get(project.environmentId) ?? [],
+        })?.model ?? "No model configured")
+      : "Unavailable";
+  };
+  const submitTask = async (project: Project, prompt: string) => {
+    if (taskSubmittingRef.current || !taskTargetAvailable(project)) return;
+    taskSubmittingRef.current = true;
+    setIsStartingTask(true);
+    const result = await settlePromise(() => startProjectTask(project, prompt));
+    taskSubmittingRef.current = false;
+    setIsStartingTask(false);
+    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    setOpen(false);
+  };
+  const taskGroups: CommandPaletteView["groups"] = task
+    ? [
+        {
+          value: task.projectKey ? "task-machines" : "task-projects",
+          label: task.projectKey ? "Machines" : "Projects",
+          items: task.projectKey
+            ? (
+                taskProjectEntries.find((entry) => entry.group.projectKey === task.projectKey)
+                  ?.members ?? []
+              )
+                .toSorted(
+                  (left, right) =>
+                    Number(right.environmentId === contextualProjectRef?.environmentId) -
+                    Number(left.environmentId === contextualProjectRef?.environmentId),
+                )
+                .map((project) => ({
+                  kind: "action" as const,
+                  value: `task-machine:${project.environmentId}:${project.id}`,
+                  searchTerms: [
+                    environmentLabelById.get(project.environmentId) ?? "",
+                    project.workspaceRoot,
+                  ],
+                  title: environmentLabelById.get(project.environmentId) ?? "Unknown machine",
+                  description: `${project.workspaceRoot} · ${taskModelLabel(project)}`,
+                  icon: <MonitorIcon className={ITEM_ICON_CLASS} />,
+                  keepOpen: true,
+                  disabled: isStartingTask || !taskTargetAvailable(project),
+                  run: async () => submitTask(project, task.prompt),
+                }))
+            : taskProjectEntries.map(({ group, members, targetProject }) => ({
+                kind: "action" as const,
+                value: `task-project:${group.projectKey}`,
+                searchTerms: members.flatMap((project) => [project.title, project.workspaceRoot]),
+                title: group.displayName,
+                description:
+                  members.length === 1 && members[0]
+                    ? `${environmentLabelById.get(members[0].environmentId) ?? "Unknown machine"} · ${members[0].workspaceRoot} · ${taskModelLabel(members[0])}`
+                    : `${members.length} machines · ${taskModelLabel(targetProject)}`,
+                icon: <FolderIcon className={ITEM_ICON_CLASS} />,
+                keepOpen: true,
+                disabled: isStartingTask || !members.some(taskTargetAvailable),
+                run: async () => {
+                  const onlyMember = members.length === 1 ? members[0] : undefined;
+                  if (onlyMember) await submitTask(onlyMember, task.prompt);
+                  else
+                    pushPaletteView({
+                      addonIcon: machineViewIcon,
+                      groups: [],
+                      task: { prompt: task.prompt, projectKey: group.projectKey },
+                    });
+                },
+              })),
+        },
+      ]
+    : [];
+
   let displayedGroups: CommandPaletteView["groups"] = filteredGroups;
-  if (newProjectFlow !== null) {
+  if (task) {
+    displayedGroups = filterCommandPaletteGroups({
+      activeGroups: taskGroups,
+      query: deferredQuery,
+      isInSubmenu: true,
+      projectSearchItems: [],
+      threadSearchItems: [],
+    });
+  } else if (newProjectFlow !== null) {
     displayedGroups = [
       ...(newProjectMachineGroup ? [newProjectMachineGroup] : []),
       ...newProjectOptionGroups,
@@ -2331,12 +2473,46 @@ function OpenCommandPaletteDialog(props: {
   } else if (isBrowsing) {
     displayedGroups = relativePathNeedsActiveProject ? [] : browseGroups;
   }
+  if (
+    currentView === null &&
+    newProjectFlow === null &&
+    addProjectCloneFlow === null &&
+    query.trim().length > 0
+  ) {
+    displayedGroups = [
+      ...displayedGroups,
+      {
+        value: "new-task",
+        label: "",
+        items: [
+          {
+            kind: "action",
+            value: "action:new-task",
+            searchTerms: [],
+            title: `New task: ${query.trim()}`,
+            description: "Choose a project and send in a new thread",
+            icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
+            keepOpen: true,
+            run: async () =>
+              pushPaletteView({
+                addonIcon: taskViewIcon,
+                groups: [],
+                task: { prompt: query.trim() },
+              }),
+          },
+        ],
+      },
+    ];
+  }
   const resultRows = buildCommandPaletteRows(displayedGroups);
   const autoHighlightsFirstRow =
     !isBrowsing && !isRemoteProjectCloneFlow && newProjectFlow === null;
 
-  const inputPlaceholder =
-    newProjectFlow !== null
+  const inputPlaceholder = currentView?.task
+    ? currentView.task.projectKey
+      ? "Choose a machine..."
+      : "Choose a project..."
+    : newProjectFlow !== null
       ? "Project name"
       : (remoteProjectInputPlaceholder(addProjectCloneFlow) ??
         getCommandPaletteInputPlaceholder(paletteMode));
@@ -2421,6 +2597,12 @@ function OpenCommandPaletteDialog(props: {
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>): void {
+    if (task && event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!taskSubmittingRef.current) popView();
+      return;
+    }
     if (event.key === "Enter" && (event.nativeEvent.isComposing || event.keyCode === 229)) {
       // Confirming an IME candidate must not submit a path or select a row.
       (event as typeof event & { preventBaseUIHandler?: () => void }).preventBaseUIHandler?.();
@@ -2795,7 +2977,8 @@ function OpenCommandPaletteDialog(props: {
       key={`${viewStack.length}-${browseGeneration}-${isBrowsing}-${newProjectFlow ? "new-project" : (addProjectCloneFlow?.step ?? "none")}`}
       aria-label="Command palette"
       autoHighlight={autoHighlightsFirstRow ? "always" : false}
-      footerActionLabel={footerActionLabel}
+      escapeLabel={task ? "Back" : "Close"}
+      footerActionLabel={isStartingTask ? "Starting…" : footerActionLabel}
       footerTrailing={footerTrailing}
       inputAccessory={inputAccessory}
       inputProps={{
@@ -2844,6 +3027,11 @@ function OpenCommandPaletteDialog(props: {
       showBackHint={isSubmenu}
       value={query}
     >
+      {task ? (
+        <div className="border-b px-4 py-3 text-sm text-muted-foreground">
+          <p className="line-clamp-2">{task.prompt}</p>
+        </div>
+      ) : null}
       {newProjectPathPreview !== null ? (
         <NewProjectSummary
           name={newProjectName}
